@@ -117,14 +117,32 @@ def wg_peers():
 # ============================================================================
 
 def init_db():
+    database_directory = os.path.dirname(
+        DB_PATH
+    )
+
     os.makedirs(
-        os.path.dirname(DB_PATH),
+        database_directory,
         exist_ok=True,
     )
 
     connection = sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
+        timeout=30,
+    )
+
+    # Improve read/write concurrency.
+    connection.execute(
+        "PRAGMA journal_mode = WAL"
+    )
+
+    connection.execute(
+        "PRAGMA synchronous = NORMAL"
+    )
+
+    connection.execute(
+        "PRAGMA busy_timeout = 30000"
     )
 
     connection.execute(
@@ -152,6 +170,33 @@ def init_db():
         """
         CREATE INDEX IF NOT EXISTS idx_peer_ts
         ON samples(pubkey, ts)
+        """
+    )
+
+    # Compact daily aggregation table.
+    #
+    # Each peer has one row per day instead of one row every
+    # five seconds.
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            date TEXT NOT NULL,
+            pubkey TEXT NOT NULL,
+            rx INTEGER NOT NULL DEFAULT 0,
+            tx INTEGER NOT NULL DEFAULT 0,
+
+            PRIMARY KEY (
+                date,
+                pubkey
+            )
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_daily_usage_date
+        ON daily_usage(date)
         """
     )
 
@@ -183,6 +228,11 @@ class Collector(threading.Thread):
 
         self.db = init_db()
 
+        # Protect SQLite operations from simultaneous collector and
+        # HTTP request threads.
+        self.db_lock = threading.Lock()
+
+        # Protect the current in-memory peer state.
         self.lock = threading.Lock()
 
         self.state = {}
@@ -228,31 +278,50 @@ class Collector(threading.Thread):
 
         snapshot = {}
         rows = []
+        daily_rows = []
 
         for peer in wg_peers():
             public_key = peer["public_key"]
 
-            previous = self.prev.get(public_key)
+            previous = self.prev.get(
+                public_key
+            )
 
             rx_rate = 0.0
             tx_rate = 0.0
 
-            if previous and now > previous[0]:
-                elapsed = now - previous[0]
+            rx_difference = 0
+            tx_difference = 0
+
+
+            if (
+                previous
+                and now > previous[0]
+            ):
+                elapsed = (
+                    now
+                    - previous[0]
+                )
+
+                rx_difference = max(
+                    0,
+                    peer["rx_bytes"]
+                    - previous[1],
+                )
+
+                tx_difference = max(
+                    0,
+                    peer["tx_bytes"]
+                    - previous[2],
+                )
 
                 rx_rate = (
-                    max(
-                        0,
-                        peer["rx_bytes"] - previous[1],
-                    )
+                    rx_difference
                     / elapsed
                 )
 
                 tx_rate = (
-                    max(
-                        0,
-                        peer["tx_bytes"] - previous[2],
-                    )
+                    tx_difference
                     / elapsed
                 )
 
@@ -298,28 +367,108 @@ class Collector(threading.Thread):
                 )
             )
 
+
+            day = time.strftime(
+                "%Y-%m-%d",
+                time.localtime(now),
+            )
+
+
+            daily_rows.append(
+                (
+                    day,
+                    public_key,
+                    rx_difference,
+                    tx_difference,
+                )
+            )
+
         with self.lock:
             self.state = snapshot
 
-        self.db.executemany(
-            """
-            INSERT INTO samples
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
+        with self.db_lock:
 
-        self.db.execute(
-            """
-            DELETE FROM samples
-            WHERE ts < ?
-            """,
-            (
-                now - self.retention,
-            ),
-        )
+            # Keep high-resolution samples for the Live tab.
 
-        self.db.commit()
+            if rows:
+                self.db.executemany(
+                    """
+                    INSERT INTO samples (
+                        ts,
+                        iface,
+                        pubkey,
+                        rx,
+                        tx,
+                        rx_rate,
+                        tx_rate
+                    )
+                    VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?
+                    )
+                    """,
+                    rows,
+                )
+
+
+            # Add each sampling interval to the peer's daily total.
+            #
+            # Because date + pubkey is the primary key, SQLite either
+            # creates the daily row or increments the existing row.
+
+            if daily_rows:
+                self.db.executemany(
+                    """
+                    INSERT INTO daily_usage (
+                        date,
+                        pubkey,
+                        rx,
+                        tx
+                    )
+                    VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?
+                    )
+
+                    ON CONFLICT (
+                        date,
+                        pubkey
+                    )
+                    DO UPDATE SET
+
+                        rx =
+                            daily_usage.rx
+                            + excluded.rx,
+
+                        tx =
+                            daily_usage.tx
+                            + excluded.tx
+                    """,
+                    daily_rows,
+                )
+
+
+            # Raw samples are only needed for recent live graphs.
+
+            self.db.execute(
+                """
+                DELETE FROM samples
+                WHERE ts < ?
+                """,
+                (
+                    now - self.retention,
+                ),
+            )
+
+
+            self.db.commit()
 
     def current(self):
         with self.lock:
@@ -337,193 +486,257 @@ class Collector(threading.Thread):
             - minutes * 60
         )
 
-        if per_peer:
-            query = self.db.execute(
-                """
-                SELECT
-                    ts,
-                    pubkey,
-                    rx_rate,
-                    tx_rate
-                FROM samples
-                WHERE ts >= ?
-                ORDER BY
-                    ts,
-                    pubkey
-                """,
-                (since,),
-            )
 
+        with self.db_lock:
+
+            if per_peer:
+                query = self.db.execute(
+                    """
+                    SELECT
+                        ts,
+                        pubkey,
+                        rx_rate,
+                        tx_rate
+
+                    FROM samples
+
+                    WHERE ts >= ?
+
+                    ORDER BY
+                        ts,
+                        pubkey
+                    """,
+                    (
+                        since,
+                    ),
+                )
+
+                rows = query.fetchall()
+
+            else:
+                query = self.db.execute(
+                    """
+                    SELECT
+                        ts,
+                        SUM(rx_rate),
+                        SUM(tx_rate)
+
+                    FROM samples
+
+                    WHERE ts >= ?
+
+                    GROUP BY ts
+
+                    ORDER BY ts
+                    """,
+                    (
+                        since,
+                    ),
+                )
+
+                rows = query.fetchall()
+
+
+        if per_peer:
             return [
                 {
-                    "ts": row[0],
-                    "pubkey": row[1],
-                    "rx": row[2] or 0,
-                    "tx": row[3] or 0,
+                    "ts":
+                        row[0],
+
+                    "pubkey":
+                        row[1],
+
+                    "rx":
+                        row[2]
+                        or 0,
+
+                    "tx":
+                        row[3]
+                        or 0,
                 }
-                for row in query
+
+                for row in rows
             ]
 
-        query = self.db.execute(
-            """
-            SELECT
-                ts,
-                SUM(rx_rate),
-                SUM(tx_rate)
-            FROM samples
-            WHERE ts >= ?
-            GROUP BY ts
-            ORDER BY ts
-            """,
-            (since,),
-        )
 
         return [
             {
-                "ts": row[0],
-                "rx": row[1] or 0,
-                "tx": row[2] or 0,
+                "ts":
+                    row[0],
+
+                "rx":
+                    row[1]
+                    or 0,
+
+                "tx":
+                    row[2]
+                    or 0,
             }
-            for row in query
+
+            for row in rows
         ]
 
     def daily_stats(
         self,
         days=30,
     ):
-        # Calculate traffic from positive changes in cumulative
-        # WireGuard counters.
-        #
-        # Daily buckets use the Ubuntu server's local calendar date.
-
-        since = (
-            int(time.time())
-            - (days + 1) * 86400
+        debug_start = time.perf_counter()
+        start_date = time.strftime(
+            "%Y-%m-%d",
+            time.localtime(
+                time.time()
+                - (
+                    days - 1
+                )
+                * 86400
+            ),
         )
 
-        query = self.db.execute(
-            """
-            SELECT
-                ts,
-                pubkey,
-                rx,
-                tx
-            FROM samples
-            WHERE ts >= ?
-            ORDER BY
-                pubkey,
-                ts
-            """,
-            (since,),
-        )
 
-        totals = {}
-        previous = {}
+        with self.db_lock:
+            query = self.db.execute(
+                """
+                SELECT
+                    date,
+                    pubkey,
+                    rx,
+                    tx
+
+                FROM daily_usage
+
+                WHERE date >= ?
+
+                ORDER BY
+                    date,
+                    pubkey
+                """,
+                (
+                    start_date,
+                ),
+            )
+
+            rows = query.fetchall()
+            debug_sql = time.perf_counter()
+
 
         names = {
-            peer["public_key"]: peer["name"]
+            peer["public_key"]:
+                peer["name"]
+
             for peer in self.current()
         }
 
+
+        daily_totals = {}
+
+
         for (
-            timestamp,
+            day,
             public_key,
             rx,
             tx,
-        ) in query:
+        ) in rows:
 
-            old = previous.get(public_key)
-
-            previous[public_key] = (
-                rx,
-                tx,
-            )
-
-            if old is None:
-                continue
-
-            rx_difference = max(
-                0,
-                rx - old[0],
-            )
-
-            tx_difference = max(
-                0,
-                tx - old[1],
-            )
-
-            day = time.strftime(
-                "%Y-%m-%d",
-                time.localtime(timestamp),
-            )
-
-            daily_bucket = totals.setdefault(
-                day,
-                {},
-            )
-
-            peer_bucket = daily_bucket.setdefault(
-                public_key,
-                {
-                    "rx": 0,
-                    "tx": 0,
-                },
-            )
-
-            peer_bucket["rx"] += rx_difference
-            peer_bucket["tx"] += tx_difference
-
-        result = []
-
-        for day in sorted(totals)[-days:]:
-            peers = []
-
-            for (
-                public_key,
-                values,
-            ) in totals[day].items():
-
-                peers.append(
+            day_bucket = (
+                daily_totals.setdefault(
+                    day,
                     {
-                        "pubkey": public_key,
-                        "name": names.get(
-                            public_key,
-                            public_key[:12] + "...",
-                        ),
-                        "rx": values["rx"],
-                        "tx": values["tx"],
-                        "total": (
-                            values["rx"]
-                            + values["tx"]
-                        ),
-                    }
+                        "rx": 0,
+                        "tx": 0,
+                        "total": 0,
+                        "peers": [],
+                    },
                 )
-
-            peers.sort(
-                key=lambda peer: peer["total"],
-                reverse=True,
             )
 
-            result.append(
+
+            total = (
+                rx
+                + tx
+            )
+
+
+            day_bucket["rx"] += rx
+            day_bucket["tx"] += tx
+            day_bucket["total"] += total
+
+
+            day_bucket["peers"].append(
                 {
-                    "date": day,
-                    "rx": sum(
-                        peer["rx"]
-                        for peer in peers
-                    ),
-                    "tx": sum(
-                        peer["tx"]
-                        for peer in peers
-                    ),
-                    "total": sum(
-                        peer["total"]
-                        for peer in peers
-                    ),
-                    "peers": peers,
+                    "pubkey":
+                        public_key,
+
+                    "name":
+                        names.get(
+                            public_key,
+                            public_key[:12]
+                            + "...",
+                        ),
+
+                    "rx":
+                        rx,
+
+                    "tx":
+                        tx,
+
+                    "total":
+                        total,
                 }
             )
 
-        return result
+
+        result = []
+
+
+        for day in sorted(
+            daily_totals
+        ):
+
+            values = daily_totals[
+                day
+            ]
+
+
+            values["peers"].sort(
+                key=lambda peer:
+                    peer["total"],
+
+                reverse=True,
+            )
+
+
+            result.append(
+                {
+                    "date":
+                        day,
+
+                    "rx":
+                        values["rx"],
+
+                    "tx":
+                        values["tx"],
+
+                    "total":
+                        values["total"],
+
+                    "peers":
+                        values["peers"],
+                }
+            )
+
+
+        debug_end = time.perf_counter()
+
+        print(
+            f"daily_stats: "
+            f"SQL={debug_sql - debug_start:.4f}s "
+            f"processing={debug_end - debug_sql:.4f}s "
+            f"total={debug_end - debug_start:.4f}s",
+            flush=True,
+        )
+        return result[
+            -days:
+        ]
 
 
 # ============================================================================
@@ -3131,7 +3344,7 @@ def main():
     parser.add_argument(
         "--retention-hours",
         type=int,
-        default=720,
+        default=48,
         help="History retention period in hours",
     )
 
@@ -3172,4 +3385,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
